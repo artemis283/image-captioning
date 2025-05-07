@@ -107,7 +107,7 @@ class DecoderBlock(nn.Module):
     
 
 class TransformerDecoder(nn.Module):
-    def __init__(self, model_name="openai/clip-vit-base-patch32", embedding_dim=512, num_heads=8, max_seq_len=19, size_of_vocab=20, num_layers=6, bias=False, dropout=0.2, head_size=64):
+    def __init__(self, model_name="openai/clip-vit-base-patch32", embedding_dim=512, num_heads=8, max_seq_len=50, size_of_vocab=10000, num_layers=6, bias=False, dropout=0.2, head_size=64):
         super().__init__()
 
         self.clip_model = CLIPTextModel.from_pretrained(model_name)
@@ -119,7 +119,7 @@ class TransformerDecoder(nn.Module):
         self.num_layers = num_layers
         self.num_heads = num_heads
         self.max_seq_len = max_seq_len
-        self.size_of_vocab = size_of_vocab
+        self.size_of_vocab = len(self.tokenizer)
         self.bias = bias
         self.dropout = dropout
         self.head_size = head_size

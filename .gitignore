@@ -1,3 +1,5 @@
 __pycache__
 .DS_Store
 image-captioning/
+venv/
+wandb/
