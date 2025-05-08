@@ -38,18 +38,7 @@ with torch.no_grad():
     image_model = CLIPVisionModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
     image_processor = AutoProcessor.from_pretrained("openai/clip-vit-base-patch32", use_fast=True)
 
-# making images the same embedding dim as caption
-class Projection(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super().__init__()
-        self.linear = nn.Linear(input_dim, output_dim)
 
-    def forward(self, x):
-        return self.linear(x)
-
-    
-projection = Projection(768, 512).to(device)
-projection = projection.to(device)
 
 
 def collate_fn(batch):
@@ -61,7 +50,6 @@ def collate_fn(batch):
         inputs = image_processor(images=images, return_tensors="pt").to(device)
         outputs = image_model(**inputs)
         vision_embeds = outputs.last_hidden_state  # (B, N, 768)
-        vision_embeds = projection(vision_embeds)  # (B, N, 512)
 
     # Tokenize captions
     caption_inputs = tokenizer(
@@ -83,20 +71,17 @@ def collate_fn(batch):
 
     input_embeddings = token_embeddings + position_embeddings  # (B, T, 512)
 
-    decoder_inputs = torch.cat((vision_embeds, input_embeddings), dim=1)  # (B, N+T, 512)
-
-    return decoder_inputs, labels
+    return vision_embeds, input_embeddings, labels
 
 
 
 
 # Defining the dataset class that takes in images and captions and returns the hidden state of the image and the caption embeddings
 class DecoderDataset(torch.utils.data.Dataset):
-    def __init__(self, images, captions, image_transform=transform, caption_model=caption_model, tokenizer=tokenizer, image_model=image_model, image_processor=image_processor, projection=projection):
+    def __init__(self, images, captions, image_transform=transform, caption_model=caption_model, tokenizer=tokenizer, image_model=image_model, image_processor=image_processor):
         self.images = images
         self.captions = captions
         self.image_transform = image_transform
-        self.projection = projection
         self.caption_model = caption_model
         self.tokenizer = tokenizer
         self.image_model = image_model
@@ -159,10 +144,7 @@ if __name__ == "__main__":
 
 
     decoder = TransformerDecoder().to(device)
-    optimizer = torch.optim.Adam([
-                {'params': decoder.parameters()},
-                {'params': projection.parameters()}
-                ], lr=learning_rate)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=learning_rate)
 
  
     for epoch in range(epochs):
@@ -170,15 +152,14 @@ if __name__ == "__main__":
         train_loss = 0
 
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
-        for inputs, labels in progress_bar:
-            inputs, labels = inputs.to(device), labels.to(device)
+        for images, captions, labels in progress_bar:
+            images, captions, labels = images.to(device), captions.to(device), labels.to(device)
 
 
             optimizer.zero_grad()
-            inputs = inputs[:, 50:, :]  # Remove the image tokens from the input sequence
 
 
-            output, loss = decoder(inputs, targets=labels)
+            output, loss = decoder(captions, images, targets=labels)
             loss.backward()
             optimizer.step()
 
@@ -192,6 +173,7 @@ if __name__ == "__main__":
         print(f"Epoch {epoch} - Train Loss: {train_loss}")
 
         torch.save(decoder.state_dict(), f"decoder_{epoch}.pth")
+
 
 
 

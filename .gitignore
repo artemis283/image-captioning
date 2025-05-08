@@ -3,3 +3,11 @@ __pycache__
 image-captioning/
 venv/
 wandb/
+*.pth
+*.pth
+*.pt
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
