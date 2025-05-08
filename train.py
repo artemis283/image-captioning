@@ -24,6 +24,7 @@ torch.manual_seed(42)
 batch_size = 32
 
 transform = transforms.Compose([
+    transforms.Resize((224, 224)),
     transforms.ToTensor(),
 ])
 
@@ -45,45 +46,49 @@ class Projection(nn.Module):
 
     def forward(self, x):
         return self.linear(x)
+
     
-projection = Projection(768, 512)
+projection = Projection(768, 512).to(device)
+projection = projection.to(device)
+
+
+def collate_fn(batch):
+    images, captions = zip(*batch)
+
+    # Stack and process images
+    images = torch.stack(images).to(device)
+    with torch.no_grad():
+        inputs = image_processor(images=images, return_tensors="pt").to(device)
+        outputs = image_model(**inputs)
+        vision_embeds = outputs.last_hidden_state  # (B, N, 768)
+        vision_embeds = projection(vision_embeds)  # (B, N, 512)
+
+    # Tokenize captions
+    caption_inputs = tokenizer(
+        list(captions),
+        return_tensors="pt",
+        padding="max_length",
+        max_length=77,
+        truncation=True
+    ).to(device)
+
+    input_ids = caption_inputs['input_ids']
+    input_ids_in = input_ids[:, :-1]
+    labels = input_ids[:, 1:]
+
+    position_ids = torch.arange(0, input_ids_in.size(1), dtype=torch.long).unsqueeze(0).repeat(input_ids_in.size(0), 1).to(device)
+
+    token_embeddings = caption_model.text_model.embeddings.token_embedding(input_ids_in)
+    position_embeddings = caption_model.text_model.embeddings.position_embedding(position_ids)
+
+    input_embeddings = token_embeddings + position_embeddings  # (B, T, 512)
+
+    decoder_inputs = torch.cat((vision_embeds, input_embeddings), dim=1)  # (B, N+T, 512)
+
+    return decoder_inputs, labels
 
 
 
-# doing preprocessing outside of dataset to make it faster
-def process_dataset(images, captions, image_model, caption_model, tokenizer, image_processor, projection, device, batch_size=32):
-    processed_captions = preprocess_captions(captions, tokenizer)
-    
-    all_data = []
-    
-    # Process images in batches
-    num_batches = (len(images) + batch_size - 1) // batch_size
-    
-    for batch_idx in tqdm(range(num_batches), desc="Processing image batches"):
-        start_idx = batch_idx * batch_size
-        end_idx = min((batch_idx + 1) * batch_size, len(images))
-        
-        # Get current batch of images
-        batch_images = [transform(images[i]) for i in range(start_idx, end_idx)]
-        
-        # Convert to format expected by processor
-        with torch.no_grad():
-            # Process all images in batch at once
-            inputs = image_processor(images=batch_images, return_tensors="pt")
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-            
-            # Run model on batch
-            outputs = image_model(**inputs)
-            batch_features = projection(outputs.last_hidden_state)
-            
-            # Store results along with preprocessed captions
-            for i, idx in enumerate(range(start_idx, end_idx)):
-                all_data.append({
-                    "image_features": batch_features[i:i+1].cpu(),
-                    "captions": processed_captions[idx]
-                })
-    
-    return all_data
 
 # Defining the dataset class that takes in images and captions and returns the hidden state of the image and the caption embeddings
 class DecoderDataset(torch.utils.data.Dataset):
@@ -102,44 +107,13 @@ class DecoderDataset(torch.utils.data.Dataset):
     
     def __getitem__(self, idx):
         image = self.images[idx]
-        captions = self.captions[idx][:5]
-        caption = captions[0]
-
         image = self.image_transform(image)
 
-        with torch.no_grad():
-
-            # getting hidden state of image from CLIP
-            inputs = self.image_processor(images=image, return_tensors="pt")
-
-            outputs = self.image_model(**inputs)
-            last_hidden_state = outputs.last_hidden_state
-
-            last_hidden_state = self.projection(last_hidden_state)
-            print(f"last_hidden_state shape: {last_hidden_state.shape}")
-
-            caption_inputs = tokenizer(caption, return_tensors="pt", padding="max_length", max_length=77, truncation=True)
-
-            input_ids = caption_inputs['input_ids'].squeeze(0)
-
-            input_ids_in = input_ids[:-1]
-            labels = input_ids[1:]
+        # make random
+        caption = self.captions[idx][random.randint(0, 4)]
 
 
-            position_ids = torch.arange(0, input_ids.shape[1], dtype=torch.long).unsqueeze(0)
-
-            input_ids_in = input_ids_in.to(device)
-            position_ids = position_ids.to(device)
-
-            token_embeddings = caption_model.text_model.embeddings.token_embedding(input_ids_in)
-            position_embeddings = caption_model.text_model.embeddings.position_embedding(position_ids)
-
-            input_embeddings = token_embeddings + position_embeddings
-            print(f"input_embeddings shape: {input_embeddings.shape}")
-
-            decoder_input = torch.cat((last_hidden_state, input_embeddings), dim=1)
-
-        return decoder_input.squeeze(0), labels.to(device)
+        return image, caption
 
 
 
@@ -161,8 +135,8 @@ train_dataset = DecoderDataset(train_images, train_captions)
 test_dataset = DecoderDataset(test_images, test_captions)
 
 
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
 
 
@@ -184,20 +158,25 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-    decoder = TransformerDecoder()
-    optimizer = torch.optim.Adam(decoder.parameters(), lr=learning_rate)
+    decoder = TransformerDecoder().to(device)
+    optimizer = torch.optim.Adam([
+                {'params': decoder.parameters()},
+                {'params': projection.parameters()}
+                ], lr=learning_rate)
 
  
-
     for epoch in range(epochs):
         decoder.train()
         train_loss = 0
 
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
-        for inputs, labels in enumerate(progress_bar):
+        for inputs, labels in progress_bar:
             inputs, labels = inputs.to(device), labels.to(device)
 
+
             optimizer.zero_grad()
+            inputs = inputs[:, 50:, :]  # Remove the image tokens from the input sequence
+
 
             output, loss = decoder(inputs, targets=labels)
             loss.backward()
@@ -212,7 +191,7 @@ if __name__ == "__main__":
 
         print(f"Epoch {epoch} - Train Loss: {train_loss}")
 
-    torch.save(decoder.state_dict(), f"decoder.pth")
+        torch.save(decoder.state_dict(), f"decoder_{epoch}.pth")
 
 
 

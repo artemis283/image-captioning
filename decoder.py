@@ -56,7 +56,7 @@ class MaskedAttention(nn.Module):
         V = V.view(batch_size, max_seq_len, self.num_heads, self.head_size).transpose(1, 2)
 
         attention = (Q @ K.transpose(-2, -1)) * (1.0/math.sqrt(K.size(-1))) # transpose swaps the last two dimensions of K = (1,5,24) @ (1,24,5) = (1,5,5)
-        mask = torch.tril(torch.ones(max_seq_len, max_seq_len)).bool().unsqueeze(0).unsqueeze(0)
+        mask = torch.tril(torch.ones(max_seq_len, max_seq_len)).bool().unsqueeze(0).unsqueeze(0).to(x.device)
         attention = attention.masked_fill(~mask[:, :, :max_seq_len, :max_seq_len], float("-inf"))  
         attention = torch.softmax(attention, dim=-1)
         attention = self.attention_dropout(attention)
@@ -107,7 +107,7 @@ class DecoderBlock(nn.Module):
     
 
 class TransformerDecoder(nn.Module):
-    def __init__(self, model_name="openai/clip-vit-base-patch32", embedding_dim=512, num_heads=8, max_seq_len=50, size_of_vocab=10000, num_layers=6, bias=False, dropout=0.2, head_size=64):
+    def __init__(self, model_name="openai/clip-vit-base-patch32", embedding_dim=512, num_heads=8, max_seq_len=50, size_of_vocab=49408, num_layers=6, bias=False, dropout=0.2, head_size=64):
         super().__init__()
 
         self.clip_model = CLIPTextModel.from_pretrained(model_name)
@@ -134,16 +134,7 @@ class TransformerDecoder(nn.Module):
         ))
 
     def forward(self, captions, targets=None):
-        caption_inputs = self.tokenizer(captions, return_tensors="pt", padding=True)
-
-        input_ids = caption_inputs['input_ids']
-        position_ids = torch.arange(0, input_ids.shape[1], dtype=torch.long).unsqueeze(0)
-
-        token_embeddings = self.clip_model.text_model.embeddings.token_embedding(input_ids)
-        position_embeddings = self.clip_model.text_model.embeddings.position_embedding(position_ids)
-
-        x = token_embeddings + position_embeddings
-        x = self.transformer['dropout'](x)
+        x = self.transformer['dropout'](captions)
 
         for block in self.transformer.blocks:
             x = block(x)
@@ -153,8 +144,8 @@ class TransformerDecoder(nn.Module):
             # compute the loss if we are given targets
             logits = self.transformer['head'](x)
             loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
                 ignore_index=-1,
             )
 
