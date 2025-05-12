@@ -1,4 +1,3 @@
-import math
 import matplotlib.pyplot as plt
 from torchvision.datasets.mnist import MNIST
 from torch.utils.data import DataLoader
@@ -115,6 +114,8 @@ class TransformerDecoder(nn.Module):
 
         self.embedding_dim = self.clip_model.config.hidden_size
 
+        self.projection = nn.Linear(768, embedding_dim)
+
         self.embedding_dim = embedding_dim
         self.num_layers = num_layers
         self.num_heads = num_heads
@@ -133,8 +134,12 @@ class TransformerDecoder(nn.Module):
             head = nn.Linear(embedding_dim, size_of_vocab, bias=bias)
         ))
 
-    def forward(self, captions, targets=None):
-        x = self.transformer['dropout'](captions)
+    def forward(self, captions, images, targets=None):
+        x = self.projection(images)
+
+        x = torch.cat((x,captions), dim=1)  # (B, N+T, 512)
+
+        x = self.transformer['dropout'](x)
 
         for block in self.transformer.blocks:
             x = block(x)
@@ -143,10 +148,11 @@ class TransformerDecoder(nn.Module):
         if targets is not None:
             # compute the loss if we are given targets
             logits = self.transformer['head'](x)
+            logits = logits[:, 50:, :]
             loss = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)),
                 targets.reshape(-1),
-                ignore_index=-1,
+                ignore_index=self.tokenizer.bos_token_id,
             )
 
         else:
