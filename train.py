@@ -40,6 +40,7 @@ with torch.no_grad():
     image_processor = AutoProcessor.from_pretrained("openai/clip-vit-base-patch32", use_fast=True)
 
 
+<<<<<<< HEAD
 # computing training accuracy
 def compute_training_accuracy(predictions, targets, pad_token_id=None):
     if pad_token_id is not None:
@@ -51,6 +52,8 @@ def compute_training_accuracy(predictions, targets, pad_token_id=None):
         correct_predictions = (predictions==targets)
         correct_count = correct_predictions.sum().float()
         total_count = targets.numel()
+=======
+>>>>>>> d9904b3140e8b7a7c1ed04838f7a3fd482f7030d
 
     accuracy = correct_count / total_count
     return accuracy
@@ -64,8 +67,11 @@ def collate_fn(batch):
         inputs = image_processor(images=images, return_tensors="pt").to(device)
         outputs = image_model(**inputs)
         vision_embeds = outputs.last_hidden_state  # (B, N, 768)
+<<<<<<< HEAD
 
     tokenizer.pad_token = tokenizer.bos_token if tokenizer.bos_token is not None else tokenizer.pad_token
+=======
+>>>>>>> d9904b3140e8b7a7c1ed04838f7a3fd482f7030d
 
     # Tokenize captions
     caption_inputs = tokenizer(
@@ -90,7 +96,10 @@ def collate_fn(batch):
     input_embeddings = token_embeddings + position_embeddings  # (B, T, 512)
 
     return vision_embeds, input_embeddings, labels
+<<<<<<< HEAD
 
+=======
+>>>>>>> d9904b3140e8b7a7c1ed04838f7a3fd482f7030d
 
 # generating captions to for inference
 def generate_caption(model, image_embeds, max_length=77, start_token_id=tokenizer.bos_token_id, eos_token_id=None):
@@ -240,6 +249,7 @@ if __name__ == "__main__":
 
 
             output, loss = decoder(captions, images, targets=labels)
+<<<<<<< HEAD
 
             # Get global features for contrastive loss
             '''image_feat_global = images.mean(dim=1)  # [B, 768]
@@ -253,6 +263,8 @@ if __name__ == "__main__":
 
             # Combined loss
             loss = caption_loss + 0.2 * contrast_loss'''
+=======
+>>>>>>> d9904b3140e8b7a7c1ed04838f7a3fd482f7030d
             loss.backward()
             optimizer.step()
 
@@ -307,3 +319,9 @@ if __name__ == "__main__":
 
 
 
+<<<<<<< HEAD
+=======
+
+
+
+>>>>>>> d9904b3140e8b7a7c1ed04838f7a3fd482f7030d

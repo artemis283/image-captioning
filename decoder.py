@@ -10,154 +10,297 @@ import PIL
 from torchvision import transforms
 from PIL import Image
 from transformers import AutoProcessor, CLIPVisionModel, CLIPTextModel, AutoTokenizer
+import random
+from decoder import TransformerDecoder
+import wandb
+from tqdm import tqdm
 import torch.nn.functional as F
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-class MaskedAttention(nn.Module):
-    def __init__(self, embedding_dim, head_size, max_seq_len, num_heads=1, bias=False, dropout=0.2):
-        super().__init__()
-        self.embedding_dim = embedding_dim
-        self.max_seq_len = max_seq_len
-        self.num_heads = num_heads
-        self.head_size = head_size
-        self.bias = bias
-        self.dropout = dropout
 
-        assert embedding_dim % num_heads == 0, "embedding_dim must be divisible by num_heads"
+print(PIL.__version__)
 
-        """arguments: 
-        embedding_dim = size of embedding dimension
-        num_heads = number of attention heads
-        max_seq_len = maximum sequence length
-        bias = whether to use bias in the linear layer
-        dropout = probability of dropout
-        """
+torch.manual_seed(42)
+batch_size = 32
 
-        self.c_attn = nn.Linear(embedding_dim, 3 * embedding_dim, bias=bias)
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
 
-        self.output_projection = nn.Linear(embedding_dim, embedding_dim, bias=bias)
+with torch.no_grad():
+    # defining the models
+    caption_model = CLIPTextModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+    tokenizer = AutoTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+    vocab_size = tokenizer.vocab_size
 
-        self.attention_dropout = nn.Dropout(dropout)
-        self.resid_dropout = nn.Dropout(dropout)
 
-        self.register_buffer("mask", torch.tril(torch.ones(max_seq_len, max_seq_len)).bool().unsqueeze(0).unsqueeze(0))
+    image_model = CLIPVisionModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+    image_processor = AutoProcessor.from_pretrained("openai/clip-vit-base-patch32", use_fast=True)
 
-    def forward(self, x): 
-        batch_size, max_seq_len, _ = x.size() 
 
-        # compute query, key and value vectors for all heads in a batch
-        # split the embedding dimension into query, key and value
-        Q, K, V = self.c_attn(x).split(self.embedding_dim, dim=2) # [batch_size, max_seq_len, embedding_dim]
+# computing training accuracy
+def compute_training_accuracy(predictions, targets, pad_token_id=None):
+    if pad_token_id is not None:
+        mask = targets != pad_token_id
+        correct_predictions = (predictions==targets) & mask
+        correct_count = correct_predictions.sum().float()
+        total_count = mask.sum().float()
+    else:
+        correct_predictions = (predictions==targets)
+        correct_count = correct_predictions.sum().float()
+        total_count = targets.numel()
+
+    accuracy = correct_count / total_count
+    return accuracy
+
+def collate_fn(batch):
+    images, captions = zip(*batch)
+
+    # Stack and process images
+    images = torch.stack(images).to(device)
+    with torch.no_grad():
+        inputs = image_processor(images=images, return_tensors="pt").to(device)
+        outputs = image_model(**inputs)
+        vision_embeds = outputs.last_hidden_state  # (B, N, 768)
+
+    tokenizer.pad_token = tokenizer.bos_token if tokenizer.bos_token is not None else tokenizer.pad_token
+
+    # Tokenize captions
+    caption_inputs = tokenizer(
+        list(captions),
+        return_tensors="pt",
+        padding="max_length",
+        max_length=77,
+        truncation=True, 
+        padding_side="right",
+        pad_to_multiple_of=77,
+    ).to(device)
+
+    input_ids = caption_inputs['input_ids']
+    input_ids_in = input_ids[:, :-1]
+    labels = input_ids[:, 1:]
+
+    position_ids = torch.arange(0, input_ids_in.size(1), dtype=torch.long).unsqueeze(0).repeat(input_ids_in.size(0), 1).to(device)
+
+    token_embeddings = caption_model.text_model.embeddings.token_embedding(input_ids_in)
+    position_embeddings = caption_model.text_model.embeddings.position_embedding(position_ids)
+
+    input_embeddings = token_embeddings + position_embeddings  # (B, T, 512)
+
+    return vision_embeds, input_embeddings, labels
+
+
+# generating captions to for inference
+def generate_caption(model, image_embeds, max_length=77, start_token_id=tokenizer.bos_token_id, eos_token_id=None):
+    model.eval()
+    
+    # Ensure image_embeds has batch size 1
+    if image_embeds.dim() == 3:  # If it's (B, N, D)
+        image_embeds = image_embeds[0:1]  # Take first image and keep batch dimension
+    
+    input_ids = torch.tensor([[start_token_id]]).to(device)  # [1, 1]
+    
+    generated_sequence = [start_token_id]
+    
+    with torch.no_grad():
+        for _ in range(max_length-1):
+            # Get embeddings from CLIP text model
+            token_embeddings = caption_model.text_model.embeddings.token_embedding(input_ids)
+            
+            # Forward pass - unpack the tuple
+            logits, _ = model(token_embeddings, image_embeds)  # Get logits and ignore loss
+            
+            # Get the prediction for the next token
+            next_token_logits = logits[:, -1, :]
+            
+            # Apply temperature to make predictions less deterministic
+            temperature = 0.7
+            next_token_logits = next_token_logits / temperature
+            
+            # Apply softmax to get probabilities
+            probs = F.softmax(next_token_logits, dim=-1)
+            
+            # Sample from the distribution instead of taking argmax
+            next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
+            
+            # Add to the sequence
+            generated_sequence.append(next_token.item())
+            
+            # Update input_ids for next iteration
+            input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=1)
+            
+            # Break if end of sequence token is generated
+            if eos_token_id is not None and next_token.item() == eos_token_id:
+                break
+    
+    return generated_sequence
+
+
+
+# Defining the dataset class that takes in images and captions and returns the hidden state of the image and the caption embeddings
+class DecoderDataset(torch.utils.data.Dataset):
+    def __init__(self, images, captions, image_transform=transform, caption_model=caption_model, tokenizer=tokenizer, image_model=image_model, image_processor=image_processor):
+        self.images = images
+        self.captions = captions
+        self.image_transform = image_transform
+        self.caption_model = caption_model
+        self.tokenizer = tokenizer
+        self.image_model = image_model
+        self.image_processor = image_processor
+
+    def __len__(self):
+        return len(self.images)
+    
+    def __getitem__(self, idx):
+        image = self.images[idx]
+        image = self.image_transform(image)
+
+        # make random
+        caption = self.captions[idx][random.randint(0, 4)]
+
+
+        return image, caption
+
+
+
+# loading the dataset
+ds = load_dataset("nlphuji/flickr30k")
+test_dataset = ds['test']
+
+
+# splitting the dataset as it only has one split
+split_dataset = test_dataset.train_test_split(test_size=0.2, seed=42)
+
+train_images = split_dataset['train']['image']
+train_captions = split_dataset['train']['caption']
+
+test_images = split_dataset['test']['image']
+test_captions = split_dataset['test']['caption']
+
+train_dataset = DecoderDataset(train_images, train_captions)
+test_dataset = DecoderDataset(test_images, test_captions)
+
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+
+
+def contrastive_loss(image_features, text_features):
+    # Normalize features
+    image_features = F.normalize(image_features, p=2, dim=-1)
+    text_features = F.normalize(text_features, p=2, dim=-1)
+    
+    # Calculate similarity
+    logits = torch.matmul(text_features, image_features.transpose(-2, -1))
+    
+    # Create labels (diagonal is positive pairs)
+    labels = torch.arange(logits.size(0), device=logits.device)
+    
+    # Calculate loss
+    loss = (F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels)) / 2
+    return loss
+
+
+
+if __name__ == "__main__":
+    torch.manual_seed(42)
+    random.seed(42)
+
+    learning_rate = 0.0005
+    epochs = 20
+
+    wandb.init(project="image-captioning", config={
+    "learning_rate": learning_rate,
+    "epochs": epochs,
+    "batch_size": batch_size,
+    })
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+    decoder = TransformerDecoder().to(device)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=learning_rate)
+
+ 
+    for epoch in range(epochs):
+        decoder.train()
+        train_loss = 0
+        total_correct = 0
+        total_count = 0
+    
+
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
+        for images, captions, labels in progress_bar:
+            images, captions, labels = images.to(device), captions.to(device), labels.to(device)
+
+
+            optimizer.zero_grad()
+
+
+            output, loss = decoder(captions, images, targets=labels)
+
+            # Get global features for contrastive loss
+            '''image_feat_global = images.mean(dim=1)  # [B, 768]
+            text_feat_global = captions.mean(dim=1)  # [B, 512]
+
+            # Project image features to match text feature dimension
+            image_feat_global = decoder.projection(image_feat_global)  # [B, 512]
+
+            # Calculate contrastive loss
+            contrast_loss = contrastive_loss(image_feat_global, text_feat_global)
+
+            # Combined loss
+            loss = caption_loss + 0.2 * contrast_loss'''
+            loss.backward()
+            optimizer.step()
+
+            # Use output[0] to get the logits for predictions
+            predictions = output.argmax(dim=-1)
+
+            mask = labels != tokenizer.bos_token_id
+            correct_predictions = (predictions==labels) & mask
+            batch_correct = correct_predictions.sum().item()
+            batch_total = mask.sum().item()
+
+            total_correct += batch_correct
+            total_count += batch_total
+
+            batch_accuracy = batch_correct / batch_total if batch_total > 0 else 0
+
+
+            train_loss += loss.item()
+
+            progress_bar.set_postfix({"loss": loss.item(), "accuracy": batch_accuracy})
+
+        for i, (images, captions, labels) in enumerate(test_loader):
+            if i >= 3: 
+                break
+                
+            images =  images.to(device)
+            
+            with torch.no_grad():
+                # Generate caption
+                caption = generate_caption(
+                    decoder, 
+                    images, 
+                    max_length=77, 
+                    start_token_id=tokenizer.bos_token_id, 
+                    eos_token_id=tokenizer.eos_token_id
+                )
         
-        # reshape the query, key and value vectors to have a separate head for each token
-        Q = Q.view(batch_size, max_seq_len, self.num_heads, self.head_size).transpose(1, 2) # [batch_size, max_seq_len, num_heads, head_size]
-        K = K.view(batch_size, max_seq_len, self.num_heads, self.head_size).transpose(1, 2)
-        V = V.view(batch_size, max_seq_len, self.num_heads, self.head_size).transpose(1, 2)
-
-        attention = (Q @ K.transpose(-2, -1)) * (1.0/math.sqrt(K.size(-1))) # transpose swaps the last two dimensions of K = (1,5,24) @ (1,24,5) = (1,5,5)
-        mask = torch.tril(torch.ones(max_seq_len, max_seq_len)).bool().unsqueeze(0).unsqueeze(0).to(x.device)
-        attention = attention.masked_fill(~mask[:, :, :max_seq_len, :max_seq_len], float("-inf"))  
-        attention = torch.softmax(attention, dim=-1)
-        attention = self.attention_dropout(attention)
-
-        hidden_state = attention @ V # [batch_size, num_heads, max_seq_len, head_size]
-
-        hidden_state = hidden_state.transpose(1, 2).contiguous().view(batch_size, max_seq_len, self.embedding_dim)
-        hidden_state = self.resid_dropout(hidden_state)
-
-        return hidden_state
-    
-
-class FNN(nn.Module):
-
-    def __init__(self, embedding_dim, bias=False, dropout=0.2):
-        super().__init__()
-
-        self.linear1 = nn.Linear(embedding_dim, 4 * embedding_dim, bias=bias)
-        self.gelu = nn.GELU()
-        self.linear2 = nn.Linear(4 * embedding_dim, embedding_dim, bias=bias)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        x = self.linear1(x)
-        x = self.gelu(x)
-        x = self.linear2(x)
-        x = self.dropout(x)
-
-        return x
-    
-
-# putting it all together
-class DecoderBlock(nn.Module):
-
-    def __init__(self, embedding_dim, head_size, max_seq_len, num_heads=1, bias=False, dropout=0.2):
-        super().__init__()
-
-        self.masked_attention = MaskedAttention(embedding_dim, head_size, max_seq_len, num_heads, bias, dropout)
-        self.fnn = FNN(embedding_dim, bias, dropout)
-        self.norm1 = nn.LayerNorm(embedding_dim)
-        self.norm2 = nn.LayerNorm(embedding_dim)
-
-    def forward(self, x):
-        x = x + self.masked_attention(self.norm1(x))
-        x = x + self.fnn(self.norm2(x))
-
-        return x
-    
-
-class TransformerDecoder(nn.Module):
-    def __init__(self, model_name="openai/clip-vit-base-patch32", embedding_dim=512, num_heads=8, max_seq_len=50, size_of_vocab=49408, num_layers=6, bias=False, dropout=0.2, head_size=64):
-        super().__init__()
-
-        self.clip_model = CLIPTextModel.from_pretrained(model_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-
-        self.embedding_dim = self.clip_model.config.hidden_size
-
-        self.projection = nn.Linear(768, embedding_dim)
-
-        self.embedding_dim = embedding_dim
-        self.num_layers = num_layers
-        self.num_heads = num_heads
-        self.max_seq_len = max_seq_len
-        self.size_of_vocab = len(self.tokenizer)
-        self.bias = bias
-        self.dropout = dropout
-        self.head_size = head_size
+                # Decode caption
+                caption_text = tokenizer.decode(caption, skip_special_tokens=True)
+                print(f"Caption: {caption_text}")
+                    
 
 
+        train_loss /= len(train_loader)
+        avg_accuracy = total_correct / total_count if total_count > 0 else 0
 
-        self.transformer = nn.ModuleDict(dict(
-            dropout = nn.Dropout(dropout),
-            blocks = nn.ModuleList([DecoderBlock(embedding_dim, head_size, max_seq_len, num_heads, bias, dropout) for _ in range(num_layers)]),
-            layer_norm = nn.LayerNorm(embedding_dim),
-            head = nn.Linear(embedding_dim, size_of_vocab, bias=bias)
-        ))
+        wandb.log({"train_loss": train_loss, "train_accuracy": avg_accuracy, "epoch": epoch})
 
-    def forward(self, captions, images, targets=None):
-        x = self.projection(images)
+        print(f"Epoch {epoch} - Train Loss: {train_loss} - Train Accuracy: {avg_accuracy}")
 
-        x = torch.cat((x,captions), dim=1)  # (B, N+T, 512)
-
-        x = self.transformer['dropout'](x)
-
-        for block in self.transformer.blocks:
-            x = block(x)
-        x = self.transformer.layer_norm(x)
-
-        if targets is not None:
-            # compute the loss if we are given targets
-            logits = self.transformer['head'](x)
-            logits = logits[:, 50:, :]
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                targets.reshape(-1),
-                ignore_index=self.tokenizer.bos_token_id,
-            )
-
-        else:
-            # only look at last token if performing inference
-            logits = self.transformer.head(x[:, [-1], :])
-            loss = None
-
-        return logits, loss
+        torch.save(decoder.state_dict(), f"decoder_{epoch}.pth")
